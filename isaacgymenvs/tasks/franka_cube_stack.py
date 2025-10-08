@@ -25,7 +25,7 @@
 # CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-
+import pytorch_kinematics as pk
 import numpy as np
 import os
 import torch
@@ -115,7 +115,7 @@ class FrankaCubeStack(VecTask):
         }
 
         # Controller type
-        self.control_type = "visualize_ik_target"  # osc, joint_tor, visualize_ik_target
+        self.control_type = "joint_tor"  # osc, joint_tor, visualize_ik_target
         assert self.control_type in {"osc", "joint_tor", "visualize_ik_target"},\
             "Invalid control type specified. Must be one of: {osc, joint_tor, visualize_ik_target}"
         
@@ -125,8 +125,8 @@ class FrankaCubeStack(VecTask):
             self.max_plot_steps = 500  # Collect data for this many steps
             self.plot_generated = False  # Flag to ensure we only plot once
 
-    
-        self.cfg["env"]["numObservations"] = 12 if self.control_type == "osc" else 19
+
+        self.cfg["env"]["numObservations"] = 12 if self.control_type == "osc" else 28
         # actions include: delta EEF if OSC (6) or joint torques (7) + bool gripper (1)
         self.cfg["env"]["numActions"] = 7 if self.control_type == "osc" else 8
 
@@ -167,6 +167,15 @@ class FrankaCubeStack(VecTask):
 
         super().__init__(config=self.cfg, rl_device=rl_device, sim_device=sim_device, graphics_device_id=graphics_device_id, headless=headless, virtual_screen_capture=virtual_screen_capture, force_render=force_render)
         
+
+
+        asset_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../assets")
+        franka_asset_file = "urdf/franka_description/robots/franka_panda_gripper.urdf"
+        urdf_path = os.path.join(asset_root, franka_asset_file)
+        self.chain = pk.build_chain_from_urdf(open(urdf_path).read())
+        self.chain = self.chain.to(device=self.device) # Move the model to the GPU
+        self.eef_link_name = "panda_grip_site"
+
         self.hold_time_achieved_buf = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
         self.success_timer_buf = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
         self.success_hold_steps = 60
@@ -277,7 +286,11 @@ class FrankaCubeStack(VecTask):
         self.franka_dof_upper_limits = []
         self._franka_effort_limits = []
         for i in range(self.num_franka_dofs):
-            franka_dof_props['driveMode'][i] = gymapi.DOF_MODE_POS  #if i > 6 else gymapi.DOF_MODE_EFFORT
+            if self.control_type == "joint_tor":
+                franka_dof_props['driveMode'][i] = gymapi.DOF_MODE_POS  if i > 6 else gymapi.DOF_MODE_EFFORT
+            else:
+                franka_dof_props['driveMode'][i] = gymapi.DOF_MODE_POS
+
             if self.physics_engine == gymapi.SIM_PHYSX:
                 franka_dof_props['stiffness'][i] = franka_dof_stiffness[i]
                 franka_dof_props['damping'][i] = franka_dof_damping[i]
@@ -447,6 +460,16 @@ class FrankaCubeStack(VecTask):
         lmbda = torch.eye(6, device=self.device) * (self.ik_control_damping ** 2)
         u = (j_eef_T @ torch.inverse(self._j_eef @ j_eef_T + lmbda) @ dpose).view(self.num_envs, 7)
         return u
+    
+    def compute_fk(self, q):
+        """
+        Computes FK  for a batch of joint configs.
+        """
+        all_link_transforms = self.chain.forward_kinematics(q)
+        eef_transforms = all_link_transforms[self.eef_link_name]
+        eef_matrix = eef_transforms.get_matrix()
+        eef_pos = eef_matrix[:, :3, 3]
+        return eef_pos
 
     # def orientation_error(self, desired, current):
     #     cc = quat_conjugate(current)
@@ -458,6 +481,7 @@ class FrankaCubeStack(VecTask):
             # Franka
             "q": self._q[:, :],
             "q_gripper": self._q[:, -2:],
+            "qd": self._qd[:, :],
             "eef_pos": self._eef_state[:, :3],
             "eef_quat": self._eef_state[:, 3:7],
             "eef_vel": self._eef_state[:, 7:],
@@ -481,21 +505,26 @@ class FrankaCubeStack(VecTask):
         self._update_states()
 
     def compute_reward(self, actions):
-        # Unpack all returned values, including the new metrics dictionary
+        # Unpack all returned values
+        q_ref_padded = torch.zeros((self.num_envs,9), device = self.device)
+        q_ref_padded[:,:7] = self.q_ref
+        q_ref_padded[:,7:9] = self.franka_default_dof_pos[7:9]
+
+        eef_pos_target = self.compute_fk(q_ref_padded)
         self.rew_buf[:], self.reset_buf[:], self.success_timer_buf[:], self.hold_time_achieved_buf[:], metrics_dict = compute_franka_reward(
             self.reset_buf, self.progress_buf, self.actions, self.states, self.reward_settings, 
-            self.max_episode_length, self.success_timer_buf, self.success_hold_steps, self.q_ref
+            self.max_episode_length, self.success_timer_buf, self.success_hold_steps, self.q_ref, eef_pos_target
         )
 
         # Populate self.extras with the metrics for the logger
-        # The isaacgymenvs runner will automatically log everything in this dictionary
+ 
         self.extras.update(metrics_dict)
 
     def compute_observations(self):
         self._refresh()
         # Simplified observations: just cube position and end effector state
         obs = ["cubeA_pos", "eef_pos", "eef_quat"]
-        obs += ["q_gripper"] if self.control_type == "osc" else ["q"]
+        obs += ["q_gripper"] if self.control_type == "osc" else ["q", "qd"]
         self.obs_buf = torch.cat([self.states[ob] for ob in obs], dim=-1)
 
         return self.obs_buf
@@ -553,6 +582,7 @@ class FrankaCubeStack(VecTask):
 
         self.progress_buf[env_ids] = 0
         self.reset_buf[env_ids] = 0
+        self.last_actions[env_ids] = 0
 
     def _reset_cubes(self, env_ids):
         # Reset cubes, sampling cube B first, then A
@@ -829,7 +859,7 @@ class FrankaCubeStack(VecTask):
         #             self.gym.add_lines(self.viewer, self.envs[i], 1, [p0[0], p0[1], p0[2], py[0], py[1], py[2]], [0.1, 0.85, 0.1])
         #             self.gym.add_lines(self.viewer, self.envs[i], 1, [p0[0], p0[1], p0[2], pz[0], pz[1], pz[2]], [0.1, 0.1, 0.85])
 
-        # self.last_actions[:] = self.actions[:]
+        self.last_actions[:] = self.actions[:]
 
 #####################################################################
 ###=========================jit functions=========================###
@@ -838,58 +868,67 @@ class FrankaCubeStack(VecTask):
 
 @torch.jit.script
 def compute_franka_reward(
-    reset_buf: Tensor, 
-    progress_buf: Tensor, 
-    actions: Tensor, 
-    states: Dict[str, Tensor], 
-    reward_settings: Dict[str, float], 
-    max_episode_length: float, 
-    success_timer_buf: Tensor, 
-    success_hold_steps: int, 
-    q_ref: Tensor
+    reset_buf: Tensor,
+    progress_buf: Tensor,
+    actions: Tensor,
+    states: Dict[str, Tensor],
+    reward_settings: Dict[str, float],
+    max_episode_length: float,
+    success_timer_buf: Tensor,
+    success_hold_steps: int,
+    q_ref: Tensor,
+    eef_pos_ref: Tensor
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Dict[str, Tensor]]:
 
-    # --- Calculate Individual Reward Components ---
-    d = torch.norm(states["cubeA_pos_relative"], dim=-1)
-    dist_reward = reward_settings["r_dist_scale"] * (1 - torch.tanh(10.0 * d))
-    close_reward = reward_settings["r_lift_scale"] * (d < 0.05).float()
+    # -----------IMITATION REWARDS-----------
+    joint_pos_w, joint_pos_sigma = 1.5, 0.1
+    eef_pos_w,   eef_pos_sigma   = 1.5, 0.1
 
-    joint_error = torch.sum(torch.square(q_ref - states["q"][:, :7]), dim=-1)
-    sigma_imitation = 0.1
-    imitation_reward = reward_settings["r_imitation_scale"] * torch.exp(-joint_error / sigma_imitation)
-    
-    # if torch.sum(torch.square(actions)) == 0.0:
-    #     print("DEBUG: Current actions are all zero.")
-    # if torch.sum(torch.square(states["last_actions"])) == 0.0:
-    #     print("DEBUG: Last actions are all zero.")
 
+    # --- 1a. Joint Position Reward  ---
+    joint_pos_error_sq = torch.sum(torch.square(q_ref - states["q"][:, :7]), dim=-1)
+    joint_pos_reward = joint_pos_w * torch.exp(-joint_pos_error_sq / joint_pos_sigma)
+
+
+    # --- 1b. End Effector Position Reward  ---
+    eef_pos_error_sq = torch.sum(torch.square(eef_pos_ref - states["eef_pos"]), dim=-1)
+    eef_pos_reward = eef_pos_w * torch.exp(-eef_pos_error_sq / eef_pos_sigma)
+
+    total_imitation_reward = joint_pos_reward  + eef_pos_reward 
+
+
+    #-------TASK-SPECIFIC REWARDS-----------
+
+    # 2a. Bonus for being close to the cube
+    dist_to_cube = torch.norm(states["cubeA_pos_relative"], dim=-1)
+    close_reward = reward_settings["r_lift_scale"] * (dist_to_cube < 0.045).float()
+
+    # Penalties to encourage smooth and efficient actions.
     action_rate_penalty = -reward_settings["r_action_rate_scale"] * torch.norm(actions - states["last_actions"], dim=-1)
     torque_penalty = -reward_settings["r_torque_scale"] * torch.sum(torch.square(actions), dim=-1)
 
-    # --- Final Combined Reward ---
-    rewards = dist_reward + close_reward + imitation_reward + action_rate_penalty + torque_penalty
 
-    # --- METRIC CALCULATIONS (e.g., RMSE) ---
-    joint_pos_error_sq = torch.square(q_ref - states["q"][:, :7])
-    joint_pos_rmse = torch.sqrt(torch.mean(joint_pos_error_sq))
-
+    # 2b. Sum all components to get the final reward
+    rewards = total_imitation_reward + close_reward + action_rate_penalty + torque_penalty
+    
     # --- Create Dictionary for Logging ---
-    # We log the mean of per-environment values and single-value metrics
     log_metrics = {
-        "rewards/dist_reward": torch.mean(dist_reward),
+        "rewards/imitation_joint_pos": torch.mean(joint_pos_reward),
+        "rewards/imitation_eef_pos": torch.mean(eef_pos_reward),
+        # "rewards/imitation_eef_height": torch.mean(eef_height_reward),
+        "rewards/total_imitation": torch.mean(total_imitation_reward),
         "rewards/close_reward": torch.mean(close_reward),
-        "rewards/imitation_reward": torch.mean(imitation_reward),
         "rewards/action_rate_penalty": torch.mean(action_rate_penalty),
         "rewards/torque_penalty": torch.mean(torque_penalty),
-        "rmse/joint_pos_imitation": joint_pos_rmse,
+        "rmse/joint_pos_imitation": torch.sqrt(torch.mean(joint_pos_error_sq)),
+        # "error/eef_pos": torch.sqrt(torch.mean(eef_pos_error_sq)),
     }
 
     # --- Episode End Logic ---
-    # Use a stricter threshold for success condition if desired
-    close_to_cube_for_hold = d < 0.045 
+    close_to_cube_for_hold = dist_to_cube < 0.045
     success_timer_buf = torch.where(close_to_cube_for_hold, success_timer_buf + 1, torch.zeros_like(success_timer_buf))
     hold_time_achieved = success_timer_buf >= success_hold_steps
-    
+
     reset_buf = torch.where(progress_buf >= max_episode_length - 1, torch.ones_like(reset_buf), reset_buf)
 
     return rewards, reset_buf, success_timer_buf, hold_time_achieved, log_metrics
