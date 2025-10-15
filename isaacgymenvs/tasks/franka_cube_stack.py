@@ -36,11 +36,13 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
+
 from isaacgym import gymtorch
 from isaacgym import gymapi
+from isaacgym import gymutil
 
 
-from isaacgymenvs.utils.torch_jit_utils import quat_mul, to_torch, tensor_clamp , quat_conjugate
+from isaacgymenvs.utils.torch_jit_utils import quat_mul, to_torch, tensor_clamp , quat_conjugate, quat_apply
 from isaacgymenvs.tasks.base.vec_task import VecTask
 
 @torch.jit.script
@@ -89,14 +91,14 @@ class FrankaCubeStack(VecTask):
     def __init__(self, cfg, rl_device, sim_device, graphics_device_id, headless, virtual_screen_capture, force_render):
         self.cfg = cfg
 
-        self.max_episode_length = self.cfg["env"]["episodeLength"]
+        self.max_episode_length = 500 #self.cfg["env"]["episodeLength"]
 
         self.action_scale = self.cfg["env"]["actionScale"]
         self.start_position_noise = self.cfg["env"]["startPositionNoise"]
         self.start_rotation_noise = self.cfg["env"]["startRotationNoise"]
         self.franka_position_noise = self.cfg["env"]["frankaPositionNoise"]
         self.franka_rotation_noise = self.cfg["env"]["frankaRotationNoise"]
-        self.franka_dof_noise = self.cfg["env"]["frankaDofNoise"]
+        self.go2_dof_noise = self.cfg["env"]["frankaDofNoise"]
         self.aggregate_mode = self.cfg["env"]["aggregateMode"]
         self.start_min_height_offset = 0.01
         self.start_max_height_offset = 0.30
@@ -106,7 +108,7 @@ class FrankaCubeStack(VecTask):
         # Create dicts to pass to reward function
         self.reward_settings = {
             "r_dist_scale": 10.0,  
-            "r_lift_scale": 5.0,   
+            "r_lift_scale": 10.0,   
             "r_align_scale": 0.0,  
             "r_stack_scale": 0.0,  
             "r_action_rate_scale": 0.01,
@@ -115,10 +117,10 @@ class FrankaCubeStack(VecTask):
         }
 
         # Controller type
-        self.control_type = "joint_tor"  # osc, joint_tor, visualize_ik_target
-        assert self.control_type in {"osc", "joint_tor", "visualize_ik_target"},\
-            "Invalid control type specified. Must be one of: {osc, joint_tor, visualize_ik_target}"
-        
+        self.control_type = "ik_position" 
+        assert self.control_type in {"ik_pd","rl","ik_position"},\
+            "Invalid control type specified. Must be one of: {ik_pd , rl, ik_position}"
+
 
         if self.control_type == "visualize_ik_target":
             self.plot_data = {"steps": [], "q_current": [], "q_target": []}
@@ -126,9 +128,9 @@ class FrankaCubeStack(VecTask):
             self.plot_generated = False  # Flag to ensure we only plot once
 
 
-        self.cfg["env"]["numObservations"] = 12 if self.control_type == "osc" else 28
-        # actions include: delta EEF if OSC (6) or joint torques (7) + bool gripper (1)
-        self.cfg["env"]["numActions"] = 7 if self.control_type == "osc" else 8
+        self.cfg["env"]["numObservations"] = 40
+
+        self.cfg["env"]["numActions"] = 18
 
         # Values to be filled in at runtime
         self.states = {}                        # will be dict filled with relevant states to use for reward calculation
@@ -136,6 +138,7 @@ class FrankaCubeStack(VecTask):
         self.num_dofs = None                    # Total number of DOFs per env
         self.actions = None                     # Current actions to be deployed
         self._init_cubeA_state = None           # Initial state of cubeA for the current env
+
 
         self._cubeA_state = None                # Current state of cubeA for the current env
 
@@ -165,16 +168,37 @@ class FrankaCubeStack(VecTask):
         self.up_axis = "z"
         self.up_axis_idx = 2
 
+        self.action_plot_generated = False
+        self.action_data_plotting = {
+                    "steps": [],
+                    "action_prior": [],
+                    "policy_action": [],
+                    "total_action": [],
+                    "decay_factor": [],
+                    "ik_target": [],
+                    "smooth_ik_target": [],
+                    "pd_torques": [],
+                    "q_current": [],
+                    "beta": []
+                }
+
         super().__init__(config=self.cfg, rl_device=rl_device, sim_device=sim_device, graphics_device_id=graphics_device_id, headless=headless, virtual_screen_capture=virtual_screen_capture, force_render=force_render)
         
-
-
-        asset_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../assets")
-        franka_asset_file = "urdf/franka_description/robots/franka_panda_gripper.urdf"
-        urdf_path = os.path.join(asset_root, franka_asset_file)
+        self.success_buf = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
+        self.asset_root = "/home/marmot/Shyam/go2_with_airbot"
+        self.go2_asset_file = "urdf/go2_with_airbot_delete_collision.urdf"
+        urdf_path = os.path.join(self.asset_root, self.go2_asset_file)
         self.chain = pk.build_chain_from_urdf(open(urdf_path).read())
         self.chain = self.chain.to(device=self.device) # Move the model to the GPU
-        self.eef_link_name = "panda_grip_site"
+        self.eef_link_name = "eef_end_link"
+                
+        # Get DOF names from PyTorch Kinematics
+        pk_dof_names = self.chain.get_joint_parameter_names()
+        print("\n--- PyTorch Kinematics DOF Order ---")
+        for i, name in enumerate(pk_dof_names):
+            print(f"{i}: {name}")
+
+        
 
         self.hold_time_achieved_buf = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
         self.success_timer_buf = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
@@ -184,22 +208,16 @@ class FrankaCubeStack(VecTask):
         self.q_ref = torch.zeros((self.num_envs, 7), device=self.device, dtype=torch.float)
 
 
-        # Franka defaults
-        self.franka_default_dof_pos = to_torch(
-            [0, 0.1963, 0, -2.6180, 0, 2.9416, 0.7854, 0.035, 0.035], device=self.device
-        )
-
-        # OSC Gains
-        self.kp = to_torch([150.] * 6, device=self.device)
-        self.kd = 2 * torch.sqrt(self.kp)
-        self.kp_null = to_torch([10.] * 7, device=self.device)
-        self.kd_null = 2 * torch.sqrt(self.kp_null)
-        #self.cmd_limit = None                   # filled in later
+        # Legs (angles for hip, thigh, calf):
+        leg_default_pos = [0.0, 0.9, -1.8] * 4  # FL, FR, RL, RR
+        # Arm (all joints at 0):
+        arm_default_pos = [0.0] * 6
+        self.go2_default_dof_pos = to_torch(leg_default_pos + arm_default_pos, device=self.device)
 
         # Set control limits
-        self.cmd_limit = to_torch([0.1, 0.1, 0.1, 0.5, 0.5, 0.5], device=self.device).unsqueeze(0) if \
-        self.control_type == "osc" else self._franka_effort_limits[:7].unsqueeze(0)
-
+        self.cmd_limit = self.effort_limits[self.arm_dof_indices].unsqueeze(0)
+        print(f"Control type: {self.control_type}")
+        print(f"Command limits set to: {self.cmd_limit}")
         # Reset all environments
         self.reset_idx(torch.arange(self.num_envs, device=self.device))
 
@@ -216,6 +234,22 @@ class FrankaCubeStack(VecTask):
         self._create_ground_plane()
         self._create_envs(self.num_envs, self.cfg["env"]['envSpacing'], int(np.sqrt(self.num_envs)))
 
+    def clear_lines(self):
+        if self.viewer:
+            self.gym.clear_lines(self.viewer)
+
+    def draw_sphere(self, pos, radius, color, env_id):
+        if self.viewer:
+            # Convert position to Vec3
+            sphere_pos = gymapi.Vec3(pos[0], pos[1], pos[2])
+            # Create a transform for the sphere
+            sphere_pose = gymapi.Transform(p=sphere_pos, r=None)
+            # Create the sphere geometry
+            sphere_geom = gymutil.WireframeSphereGeometry(radius, 20, 20, None, color=color)
+            # Draw the sphere
+            gymutil.draw_lines(sphere_geom, self.gym, self.viewer, self.envs[env_id], sphere_pose)
+
+
     def _create_ground_plane(self):
         plane_params = gymapi.PlaneParams()
         plane_params.normal = gymapi.Vec3(0.0, 0.0, 1.0)
@@ -225,14 +259,12 @@ class FrankaCubeStack(VecTask):
         lower = gymapi.Vec3(-spacing, -spacing, 0.0)
         upper = gymapi.Vec3(spacing, spacing, spacing)
 
-        asset_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../assets")
-        franka_asset_file = "urdf/franka_description/robots/franka_panda_gripper.urdf"
+        self.asset_root = "/home/marmot/Shyam/go2_with_airbot"
+        self.go2_asset_file = "urdf/go2_with_airbot_delete_collision.urdf"
 
-        if "asset" in self.cfg["env"]:
-            asset_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), self.cfg["env"]["asset"].get("assetRoot", asset_root))
-            franka_asset_file = self.cfg["env"]["asset"].get("assetFileNameFranka", franka_asset_file)
 
-        # load franka asset
+
+        # load  asset
         asset_options = gymapi.AssetOptions()
         asset_options.flip_visual_attachments = True
         asset_options.fix_base_link = True
@@ -241,156 +273,105 @@ class FrankaCubeStack(VecTask):
         asset_options.thickness = 0.001
         asset_options.default_dof_drive_mode = gymapi.DOF_MODE_EFFORT
         asset_options.use_mesh_materials = True
-        franka_asset = self.gym.load_asset(self.sim, asset_root, franka_asset_file, asset_options)
-         
-        #BeyondMimic (for the arm)
-        franka_dof_stiffness = to_torch([2368.7, 2368.7, 1776.5, 1776.5, 1776.5, 789.6, 789.6, 800.0, 800.0], dtype=torch.float, device=self.device)
-        franka_dof_damping = to_torch([150.8, 150.8, 113.1, 113.1, 113.1, 50.3, 50.3, 40.0, 40.0], dtype=torch.float, device=self.device)
+        
 
-        # franka_dof_stiffness= to_torch([400, 400, 400, 400, 400, 400, 400, 800.0, 800.0], dtype=torch.float, device=self.device)
-        # franka_dof_damping = to_torch([40, 40, 40, 40, 40, 40, 40, 40.0, 40.0], dtype=torch.float, device=self.device)
+        go2_asset = self.gym.load_asset(self.sim, self.asset_root, self.go2_asset_file, asset_options)
+        
+        print("\n--- RIGID BODY INDICES FOR GO2 ASSET ---")
+        body_names = self.gym.get_asset_rigid_body_names(go2_asset)
+        for i, name in enumerate(body_names):
+            print(f"Body Index {i}: {name}")
+        print("----------------------------------------\n")
 
-        # Create table asset
-        table_pos = [0.0, 0.0, 1.0]
-        table_thickness = 0.05
-        table_opts = gymapi.AssetOptions()
-        table_opts.fix_base_link = True
-        table_asset = self.gym.create_box(self.sim, *[1.2, 1.2, table_thickness], table_opts)
 
-        # Create table stand asset
-        table_stand_height = 0.1
-        table_stand_pos = [-0.5, 0.0, 1.0 + table_thickness / 2 + table_stand_height / 2]
-        table_stand_opts = gymapi.AssetOptions()
-        table_stand_opts.fix_base_link = True
-        table_stand_asset = self.gym.create_box(self.sim, *[0.2, 0.2, table_stand_height], table_opts)
+        isaac_dof_names = self.gym.get_asset_dof_names(go2_asset)
+        print("--- Isaac Gym DOF Order ---")
+        for i, name in enumerate(isaac_dof_names):
+            print(f"{i}: {name}")
+
+        
+        self.num_dofs = self.gym.get_asset_dof_count(go2_asset)
+        print("num dofs: ", self.num_dofs)
+        self.num_bodies  = self.gym.get_asset_rigid_body_count(go2_asset)
+        
+        dof_props = self.gym.get_asset_dof_properties(go2_asset)
+        dof_names = self.gym.get_asset_dof_names(go2_asset)
+
+        #PD params
+        leg_stiffness = 30.0
+        leg_damping = 1.0
+        self.arm_stiffness = to_torch([400.0, 400.0, 200.0, 200.0, 10.0, 10.0], device=self.device)
+        self.arm_damping = to_torch([40.0, 40.0, 20.0, 20.0, 0.5, 0.5], device=self.device)
+
+        # #BeyondMimic (for the arm)
+        # # self.franka_dof_stiffness = to_torch([2368.7, 2368.7, 1776.5, 1776.5, 1776.5, 789.6, 789.6, 800.0, 800.0], dtype=torch.float, device=self.device)
+        # # self.franka_dof_damping = to_torch([30.0, 30.0, 22.0, 22.0, 22.0, 10.0, 10.0, 40.0, 40.0], dtype=torch.float, device=self.device)
+
+        self.leg_dof_indices = []
+        self.arm_dof_indices = []
+        arm_joint_counter = 0
+        
+        for i in range(self.num_dofs):
+            name = dof_names[i]
+
+            if "_hip" in name or "_thigh" in name or "_calf" in name:
+                dof_props["driveMode"][i] = gymapi.DOF_MODE_POS
+                dof_props['stiffness'][i] = leg_stiffness
+                dof_props['damping'][i] = leg_damping
+                self.leg_dof_indices.append(i)
+
+            elif "airbot_j" in name:
+                dof_props["driveMode"][i] = gymapi.DOF_MODE_POS if self.control_type == "ik_position" else gymapi.DOF_MODE_EFFORT
+                dof_props['stiffness'][i] = self.arm_stiffness[arm_joint_counter]
+                dof_props['damping'][i] = self.arm_damping[arm_joint_counter]
+                self.arm_dof_indices.append(i)
+                arm_joint_counter += 1
+
+        self.leg_dof_indices = to_torch(self.leg_dof_indices, device=self.device, dtype=torch.long)
+        self.arm_dof_indices = to_torch(self.arm_dof_indices, device=self.device, dtype=torch.long)
+
+        self.dof_lower_limits = to_torch(dof_props['lower'], device=self.device)
+        self.dof_upper_limits = to_torch(dof_props['upper'], device=self.device)
+        self.effort_limits = to_torch(dof_props['effort'], device=self.device)
+
+        # Define start pose for franka
+        go2_start_pose = gymapi.Transform()
+        go2_start_pose.p = gymapi.Vec3(0.0,0.0,0.35)
+        go2_start_pose.r = gymapi.Quat(0.0, 0.0, 0.0, 1.0)
+        self.robot_base_pos = to_torch([-0.5, 0.0], device=self.device)
+
+        self.robots = []
+        self.envs = []
 
         self.cubeA_size = 0.02
 
         # Create cubeA asset
         cubeA_opts = gymapi.AssetOptions()
         cubeA_opts.fix_base_link = True
-        cubeA_opts.disable_gravity = True
+        cubeA_opts.disable_gravity = False
         cubeA_asset = self.gym.create_box(self.sim, *([self.cubeA_size] * 3), cubeA_opts)
         cubeA_color = gymapi.Vec3(0.6, 0.1, 0.0)
 
-
-        self.num_franka_bodies = self.gym.get_asset_rigid_body_count(franka_asset)
-        self.num_franka_dofs = self.gym.get_asset_dof_count(franka_asset)
-
-        print("num franka bodies: ", self.num_franka_bodies)
-        print("num franka dofs: ", self.num_franka_dofs)
-
-        # set franka dof properties
-        franka_dof_props = self.gym.get_asset_dof_properties(franka_asset)
-        self.franka_dof_lower_limits = []
-        self.franka_dof_upper_limits = []
-        self._franka_effort_limits = []
-        for i in range(self.num_franka_dofs):
-            if self.control_type == "joint_tor":
-                franka_dof_props['driveMode'][i] = gymapi.DOF_MODE_POS  if i > 6 else gymapi.DOF_MODE_EFFORT
-            else:
-                franka_dof_props['driveMode'][i] = gymapi.DOF_MODE_POS
-
-            if self.physics_engine == gymapi.SIM_PHYSX:
-                franka_dof_props['stiffness'][i] = franka_dof_stiffness[i]
-                franka_dof_props['damping'][i] = franka_dof_damping[i]
-            else:
-                franka_dof_props['stiffness'][i] = 7000.0
-                franka_dof_props['damping'][i] = 50.0
-
-            self.franka_dof_lower_limits.append(franka_dof_props['lower'][i])
-            self.franka_dof_upper_limits.append(franka_dof_props['upper'][i])
-            self._franka_effort_limits.append(franka_dof_props['effort'][i])
-
-        self.franka_dof_lower_limits = to_torch(self.franka_dof_lower_limits, device=self.device)
-        self.franka_dof_upper_limits = to_torch(self.franka_dof_upper_limits, device=self.device)
-        self._franka_effort_limits = to_torch(self._franka_effort_limits, device=self.device)
-        self.franka_dof_speed_scales = torch.ones_like(self.franka_dof_lower_limits)
-        self.franka_dof_speed_scales[[7, 8]] = 0.1
-        franka_dof_props['effort'][7] = 200
-        franka_dof_props['effort'][8] = 200
-
-        # Define start pose for franka
-        franka_start_pose = gymapi.Transform()
-        franka_start_pose.p = gymapi.Vec3(-0.45, 0.0, 1.0 + table_thickness / 2 + table_stand_height)
-        franka_start_pose.r = gymapi.Quat(0.0, 0.0, 0.0, 1.0)
-        self.robot_base_pos = to_torch([-0.5, 0.0], device=self.device)
-
-        # Define start pose for table
-        table_start_pose = gymapi.Transform()
-        table_start_pose.p = gymapi.Vec3(*table_pos)
-        table_start_pose.r = gymapi.Quat(0.0, 0.0, 0.0, 1.0)
-        self._table_surface_pos = np.array(table_pos) + np.array([0, 0, table_thickness / 2])
-        self._table_surface_pos = to_torch(self._table_surface_pos, device=self.device)
-
-        self.reward_settings["table_height"] = self._table_surface_pos[2]
-
-        # Define start pose for table stand
-        table_stand_start_pose = gymapi.Transform()
-        table_stand_start_pose.p = gymapi.Vec3(*table_stand_pos)
-        table_stand_start_pose.r = gymapi.Quat(0.0, 0.0, 0.0, 1.0)
-
-        # Define start pose for cubes (doesn't really matter since they're get overridden during reset() anyways)
-        cubeA_start_pose = gymapi.Transform()
-        cubeA_start_pose.p = gymapi.Vec3(-1.0, 0.0, 0.0)
-        cubeA_start_pose.r = gymapi.Quat(0.0, 0.0, 0.0, 1.0)
-
-
-        # compute aggregate size
-        num_franka_bodies = self.gym.get_asset_rigid_body_count(franka_asset)
-        num_franka_shapes = self.gym.get_asset_rigid_shape_count(franka_asset)
-        max_agg_bodies = num_franka_bodies + 3    # 1 for table, table stand, cubeA
-        max_agg_shapes = num_franka_shapes + 3          # 1 for table, table stand, cubeA
-
-        self.frankas = []
-        self.envs = []
 
         # Create environments
         for i in range(self.num_envs):
             # create env instance
             env_ptr = self.gym.create_env(self.sim, lower, upper, num_per_row)
 
-            # Create actors and define aggregate group appropriately depending on setting
-            # NOTE: franka should ALWAYS be loaded first in sim!
-            if self.aggregate_mode >= 3:
-                self.gym.begin_aggregate(env_ptr, max_agg_bodies, max_agg_shapes, True)
+            robot_actor = self.gym.create_actor(env_ptr, go2_asset, go2_start_pose, "go2_arm", i, 0, 0)
+            self.gym.set_actor_dof_properties(env_ptr, robot_actor, dof_props)
 
-            # Create franka
-            # Potentially randomize start pose
-            if self.franka_position_noise > 0:
-                rand_xy = self.franka_position_noise * (-1. + np.random.rand(2) * 2.0)
-                franka_start_pose.p = gymapi.Vec3(-0.45 + rand_xy[0], 0.0 + rand_xy[1],
-                                                 1.0 + table_thickness / 2 + table_stand_height)
-            if self.franka_rotation_noise > 0:
-                rand_rot = torch.zeros(1, 3)
-                rand_rot[:, -1] = self.franka_rotation_noise * (-1. + np.random.rand() * 2.0)
-                new_quat = axisangle2quat(rand_rot).squeeze().numpy().tolist()
-                franka_start_pose.r = gymapi.Quat(*new_quat)
-            franka_actor = self.gym.create_actor(env_ptr, franka_asset, franka_start_pose, "franka", i, 0, 0)
-            self.gym.set_actor_dof_properties(env_ptr, franka_actor, franka_dof_props)
+            cubeA_start_pose = gymapi.Transform()
+            cubeA_start_pose.p= gymapi.Vec3(10.0, 10.0, 10.0)
 
-            if self.aggregate_mode == 2:
-                self.gym.begin_aggregate(env_ptr, max_agg_bodies, max_agg_shapes, True)
-
-            # Create table
-            table_actor = self.gym.create_actor(env_ptr, table_asset, table_start_pose, "table", i, 1, 0)
-            table_stand_actor = self.gym.create_actor(env_ptr, table_stand_asset, table_stand_start_pose, "table_stand",
-                                                      i, 1, 0)
-
-            if self.aggregate_mode == 1:
-                self.gym.begin_aggregate(env_ptr, max_agg_bodies, max_agg_shapes, True)
-
-            # Create cubes
             self._cubeA_id = self.gym.create_actor(env_ptr, cubeA_asset, cubeA_start_pose, "cubeA", i+1, 0, 0)
             # Set colors
             self.gym.set_rigid_body_color(env_ptr, self._cubeA_id, 0, gymapi.MESH_VISUAL, cubeA_color)
 
-            if self.aggregate_mode > 0:
-                self.gym.end_aggregate(env_ptr)
 
             # Store the created env pointers
             self.envs.append(env_ptr)
-            self.frankas.append(franka_actor)
+            self.robots.append(robot_actor)
 
         # Setup init state buffer
         self._init_cubeA_state = torch.zeros(self.num_envs, 13, device=self.device)
@@ -399,66 +380,66 @@ class FrankaCubeStack(VecTask):
         self.init_data()
 
     def init_data(self):
-        # Setup sim handles
         env_ptr = self.envs[0]
-        franka_handle = 0
+        robot_handle = self.robots[0] 
+
+
+        eef_handle = self.gym.find_actor_rigid_body_handle(env_ptr, robot_handle, "eef_end_link")
+
+
         self.handles = {
-            # Franka
-            "hand": self.gym.find_actor_rigid_body_handle(env_ptr, franka_handle, "panda_hand"),
-            "leftfinger_tip": self.gym.find_actor_rigid_body_handle(env_ptr, franka_handle, "panda_leftfinger_tip"),
-            "rightfinger_tip": self.gym.find_actor_rigid_body_handle(env_ptr, franka_handle, "panda_rightfinger_tip"),
-            "grip_site": self.gym.find_actor_rigid_body_handle(env_ptr, franka_handle, "panda_grip_site"),
-            # Cubes
+            "trunk": self.gym.find_actor_rigid_body_handle(env_ptr, robot_handle, "trunk"),
+            "eef": eef_handle,
             "cubeA_body_handle": self.gym.find_actor_rigid_body_handle(self.envs[0], self._cubeA_id, "box"),
         }
 
-        # Get total DOFs
-        self.num_dofs = self.gym.get_sim_dof_count(self.sim) // self.num_envs
+        print("\n--- RIGID BODY HANDLE VERIFICATION ---")
+        print(f"Actor Handle for Robot: {robot_handle}")
+        print(f"Searching for link name: 'eef_end_link'")
+        print(f"Found EEF Handle: {self.handles['eef']} (Should be 40)")
+        if self.handles['eef'] != 40:
+            print("!!! WARNING: INCORRECT EEF HANDLE FOUND. IK WILL FAIL. !!!")
 
-        # Setup tensor buffers
         _actor_root_state_tensor = self.gym.acquire_actor_root_state_tensor(self.sim)
         _dof_state_tensor = self.gym.acquire_dof_state_tensor(self.sim)
         _rigid_body_state_tensor = self.gym.acquire_rigid_body_state_tensor(self.sim)
-        self._root_state = gymtorch.wrap_tensor(_actor_root_state_tensor).view(self.num_envs, -1, 13)
-        self._dof_state = gymtorch.wrap_tensor(_dof_state_tensor).view(self.num_envs, -1, 2)
+        _jacobian_tensor = self.gym.acquire_jacobian_tensor(self.sim, "go2_arm")
+
+
+        self._root_state = gymtorch.wrap_tensor(_actor_root_state_tensor)
+        self._dof_state = gymtorch.wrap_tensor(_dof_state_tensor)
         self._rigid_body_state = gymtorch.wrap_tensor(_rigid_body_state_tensor).view(self.num_envs, -1, 13)
+        self._jacobian = gymtorch.wrap_tensor(_jacobian_tensor)
+        
+
+        self._root_state = self._root_state.view(self.num_envs, -1, 13) 
+        
+        # State of the robot's base (the first actor)
+        self._base_state = self._root_state[:, 0, :]
+        
+        # State of the cube (the second actor)
+        self._cubeA_state = self._root_state[:, 1, :]
+
+        self._dof_state = self._dof_state.view(self.num_envs, self.num_dofs, 2)
         self._q = self._dof_state[..., 0]
         self._qd = self._dof_state[..., 1]
-        self._eef_state = self._rigid_body_state[:, self.handles["grip_site"], :]
-        self._eef_lf_state = self._rigid_body_state[:, self.handles["leftfinger_tip"], :]
-        self._eef_rf_state = self._rigid_body_state[:, self.handles["rightfinger_tip"], :]
-        _jacobian = self.gym.acquire_jacobian_tensor(self.sim, "franka")
-        jacobian = gymtorch.wrap_tensor(_jacobian)
-        hand_joint_index = self.gym.get_actor_joint_dict(env_ptr, franka_handle)['panda_hand_joint']
-        self._j_eef = jacobian[:, hand_joint_index, :, :7]
-        _massmatrix = self.gym.acquire_mass_matrix_tensor(self.sim, "franka")
-        mm = gymtorch.wrap_tensor(_massmatrix)
-        self._mm = mm[:, :7, :7]
-        self._cubeA_state = self._root_state[:, self._cubeA_id, :]
 
-        # Initialize states
-        self.states.update({
-            "cubeA_size": torch.ones_like(self._eef_state[:, 0]) * self.cubeA_size,
-        })
-
-        # Initialize actions
         self._pos_control = torch.zeros((self.num_envs, self.num_dofs), dtype=torch.float, device=self.device)
         self._effort_control = torch.zeros_like(self._pos_control)
 
-        # Initialize control
-        self._arm_control = self._effort_control[:, :7]
-        self._gripper_control = self._pos_control[:, 7:9]
+        self._global_indices = torch.arange(self.num_envs * 2, dtype=torch.int32,
+                                        device=self.device).view(self.num_envs, -1)
+        
 
-        # Initialize indices
-        self._global_indices = torch.arange(self.num_envs * 4, dtype=torch.int32,
-                                           device=self.device).view(self.num_envs, -1)
-    
+        self.joint_4_raw_ik_output = []
+        self.joint_4_smoothed_ik_output = []
+
 
     def control_ik(self,dpose):
         # solve damped least squares
         j_eef_T = torch.transpose(self._j_eef, 1, 2)
         lmbda = torch.eye(6, device=self.device) * (self.ik_control_damping ** 2)
-        u = (j_eef_T @ torch.inverse(self._j_eef @ j_eef_T + lmbda) @ dpose).view(self.num_envs, 7)
+        u = (j_eef_T @ torch.inverse(self._j_eef @ j_eef_T + lmbda) @ dpose).view(self.num_envs, 6)
         return u
     
     def compute_fk(self, q):
@@ -471,28 +452,34 @@ class FrankaCubeStack(VecTask):
         eef_pos = eef_matrix[:, :3, 3]
         return eef_pos
 
-    # def orientation_error(self, desired, current):
-    #     cc = quat_conjugate(current)
-    #     q_r = quat_mul(desired, cc)
-    #     return q_r[:, 0:3] * torch.sign(q_r[:, 3]).unsqueeze(-1)
 
     def _update_states(self):
-        self.states.update({
-            # Franka
-            "q": self._q[:, :],
-            "q_gripper": self._q[:, -2:],
-            "qd": self._qd[:, :],
-            "eef_pos": self._eef_state[:, :3],
-            "eef_quat": self._eef_state[:, 3:7],
-            "eef_vel": self._eef_state[:, 7:],
-            "eef_lf_pos": self._eef_lf_state[:, :3],
-            "eef_rf_pos": self._eef_rf_state[:, :3],
-            # Cubes
-            "cubeA_quat": self._cubeA_state[:, 3:7],
-            "cubeA_pos": self._cubeA_state[:, :3],
-            "cubeA_pos_relative": self._cubeA_state[:, :3] - self._eef_state[:, :3],
-            "last_actions": self.last_actions,
-        })
+            """
+            Gathers all relevant states from the simulation tensors and stores them
+            in a convenient dictionary, self.states.
+            This is called once per simulation step in the _refresh() method.
+            """
+
+            eef_body_index = self.handles["eef"]
+            self._j_eef = self._jacobian[:, eef_body_index, :, self.arm_dof_indices]
+            relative_cube_pos = self._cubeA_state[:, :3] - self._rigid_body_state[:, self.handles["eef"], :3]
+
+            self.states.update({
+
+                "q_arm": self._q[:, self.arm_dof_indices],
+
+                "qd_arm": self._qd[:, self.arm_dof_indices],
+
+                "eef_pos": self._rigid_body_state[:, self.handles["eef"], :3],
+
+                "eef_quat": self._rigid_body_state[:, self.handles["eef"], 3:7],
+
+                "cubeA_pos": self._cubeA_state[:, :3],
+
+                "cubeA_pos_relative": relative_cube_pos,
+
+                "last_actions": self.last_actions
+            })
 
     def _refresh(self):
         self.gym.refresh_actor_root_state_tensor(self.sim)
@@ -504,94 +491,85 @@ class FrankaCubeStack(VecTask):
         # Refresh states
         self._update_states()
 
+
     def compute_reward(self, actions):
-        # Unpack all returned values
-        q_ref_padded = torch.zeros((self.num_envs,9), device = self.device)
-        q_ref_padded[:,:7] = self.q_ref
-        q_ref_padded[:,7:9] = self.franka_default_dof_pos[7:9]
+        """
+        This method gathers the necessary state tensors from the environment
+        and calls the JIT-compiled reward function.
+        """
 
-        eef_pos_target = self.compute_fk(q_ref_padded)
-        self.rew_buf[:], self.reset_buf[:], self.success_timer_buf[:], self.hold_time_achieved_buf[:], metrics_dict = compute_franka_reward(
-            self.reset_buf, self.progress_buf, self.actions, self.states, self.reward_settings, 
-            self.max_episode_length, self.success_timer_buf, self.success_hold_steps, self.q_ref, eef_pos_target
+        
+        # Calculate distance to cube
+        dist_to_cube = torch.norm(self.states["cubeA_pos_relative"], dim=-1)
+        
+        # Get base state information
+        base_lin_vel = self._base_state[:, 7:10]
+        base_ang_vel = self._base_state[:, 10:13]
+        trunk_height = self._base_state[:, 2]
+        
+
+        self.rew_buf[:], self.reset_buf[:], metrics = compute_go2_arm_reward(
+            self.rew_buf,
+            self.reset_buf,
+            self.progress_buf,
+            self.actions,
+            base_lin_vel,
+            base_ang_vel,
+            trunk_height,
+            dist_to_cube,
+            self.max_episode_length
         )
-
-        # Populate self.extras with the metrics for the logger
- 
-        self.extras.update(metrics_dict)
+        
+        self.extras.update(metrics)
 
     def compute_observations(self):
         self._refresh()
-        # Simplified observations: just cube position and end effector state
+
         obs = ["cubeA_pos", "eef_pos", "eef_quat"]
-        obs += ["q_gripper"] if self.control_type == "osc" else ["q", "qd"]
+        obs += ["q_arm", "qd_arm", "last_actions"]
         self.obs_buf = torch.cat([self.states[ob] for ob in obs], dim=-1)
 
         return self.obs_buf
 
     def reset_idx(self, env_ids):
-        env_ids_int32 = env_ids.to(dtype=torch.int32)
+            env_ids_int32 = env_ids.to(dtype=torch.int32)
+            self._reset_init_cube_state(cube='A', env_ids=env_ids)
+            self._cubeA_state[env_ids] = self._init_cubeA_state[env_ids]
 
-        # Reset cubes, sampling cube B first, then A
-        # if not self._i:
-        self._reset_init_cube_state(cube='A', env_ids=env_ids)
-        # self._i = True
 
-        # Write these new init states to the sim states
-        self._cubeA_state[env_ids] = self._init_cubeA_state[env_ids]
+            reset_noise = torch.rand((len(env_ids), self.num_dofs), device=self.device) 
+            
+            pos = tensor_clamp(
+                self.go2_default_dof_pos.unsqueeze(0) +
+                self.go2_dof_noise * 2.0 * (reset_noise - 0.5), 
+                self.dof_lower_limits.unsqueeze(0), self.dof_upper_limits.unsqueeze(0))
 
-        # Reset agent
-        reset_noise = torch.rand((len(env_ids), 9), device=self.device)
-        pos = tensor_clamp(
-            self.franka_default_dof_pos.unsqueeze(0) +
-            self.franka_dof_noise * 2.0 * (reset_noise - 0.5),
-            self.franka_dof_lower_limits.unsqueeze(0), self.franka_dof_upper_limits)
+            self._q[env_ids, :] = pos
+            self._qd[env_ids, :] = torch.zeros_like(self._qd[env_ids])
+            self._pos_control[env_ids, :] = pos
+            self._effort_control[env_ids, :] = torch.zeros_like(pos)
+            
+            multi_env_ids_int32 = self._global_indices[env_ids, 0].flatten()
+            self.gym.set_dof_state_tensor_indexed(self.sim,
+                                                gymtorch.unwrap_tensor(self._dof_state),
+                                                gymtorch.unwrap_tensor(multi_env_ids_int32),
+                                                len(multi_env_ids_int32))
 
-        # Overwrite gripper init pos (no noise since these are always position controlled)
-        pos[:, -2:] = self.franka_default_dof_pos[-1:]
+            multi_env_ids_cubes_int32 = self._global_indices[env_ids, 1].flatten()
+            self.gym.set_actor_root_state_tensor_indexed(
+                self.sim, gymtorch.unwrap_tensor(self._root_state),
+                gymtorch.unwrap_tensor(multi_env_ids_cubes_int32), len(multi_env_ids_cubes_int32))
 
-        # Reset the internal obs accordingly
-        self._q[env_ids, :] = pos
-        self._qd[env_ids, :] = torch.zeros_like(self._qd[env_ids])
-
-        # Set any position control to the current position, and any vel / effort control to be 0
-        # NOTE: Task takes care of actually propagating these controls in sim using the SimActions API
-        self._pos_control[env_ids, :] = pos
-        self._effort_control[env_ids, :] = torch.zeros_like(pos)
-
-        # Deploy updates
-        multi_env_ids_int32 = self._global_indices[env_ids, 0].flatten()
-        self.gym.set_dof_position_target_tensor_indexed(self.sim,
-                                                        gymtorch.unwrap_tensor(self._pos_control),
-                                                        gymtorch.unwrap_tensor(multi_env_ids_int32),
-                                                        len(multi_env_ids_int32))
-        self.gym.set_dof_actuation_force_tensor_indexed(self.sim,
-                                                        gymtorch.unwrap_tensor(self._effort_control),
-                                                        gymtorch.unwrap_tensor(multi_env_ids_int32),
-                                                        len(multi_env_ids_int32))
-        self.gym.set_dof_state_tensor_indexed(self.sim,
-                                              gymtorch.unwrap_tensor(self._dof_state),
-                                              gymtorch.unwrap_tensor(multi_env_ids_int32),
-                                              len(multi_env_ids_int32))
-
-        # Update cube states
-        multi_env_ids_cubes_int32 = self._global_indices[env_ids, -1:].flatten()
-        self.gym.set_actor_root_state_tensor_indexed(
-            self.sim, gymtorch.unwrap_tensor(self._root_state),
-            gymtorch.unwrap_tensor(multi_env_ids_cubes_int32), len(multi_env_ids_cubes_int32))
-
-        self.progress_buf[env_ids] = 0
-        self.reset_buf[env_ids] = 0
-        self.last_actions[env_ids] = 0
+            self.progress_buf[env_ids] = 0
+            self.reset_buf[env_ids] = 0
+            self.last_actions[env_ids] = 0
 
     def _reset_cubes(self, env_ids):
-        # Reset cubes, sampling cube B first, then A
+
         self._reset_init_cube_state(cube='A', env_ids=env_ids)
 
-        # Write these new init states to the sim states
         self._cubeA_state[env_ids] = self._init_cubeA_state[env_ids]
-        
-        # Update cube states in the simulation
+
         multi_env_ids_cubes_int32 = self._global_indices[env_ids, -1:].flatten()
         self.gym.set_actor_root_state_tensor_indexed(
             self.sim, gymtorch.unwrap_tensor(self._root_state),
@@ -599,76 +577,49 @@ class FrankaCubeStack(VecTask):
         
     def _reset_init_cube_state(self, cube, env_ids):
             """
-            Simplified method to sample cube positions.
-            - Cube B is set to a fixed, out-of-the-way location.
-            - Cube A is randomized in a safe zone, away from the robot base.
+            Resets the cube to a random position within the arm's workspace,
+            relative to the robot's base.
             """
-            if env_ids is None:
-                env_ids = torch.arange(self.num_envs, device=self.device)
+            if env_ids is None or len(env_ids) == 0:
+                return
+
             num_resets = len(env_ids)
 
-            if cube.lower() == 'a':
-                # --- Cube A: Randomize in a safe zone ---
-                sampled_cube_state = torch.zeros(num_resets, 13, device=self.device)
-                
-                # Set fixed height and orientation
-                base_z = self._table_surface_pos[2] + self.cubeA_size / 2
-                # Add a random offset between min and max height settings
-                height_range = self.start_max_height_offset - self.start_min_height_offset
-                random_offsets = height_range * torch.rand(num_resets, device=self.device) + self.start_min_height_offset
-                sampled_cube_state[:, 2] = base_z + random_offsets
-                sampled_cube_state[:, 6] = 1.0
+            robot_base_pos = self._base_state[env_ids, 0:3]
 
-                # Loop to find a valid XY position
-                active_idx = torch.arange(num_resets, device=self.device)
-                for _ in range(100): # Max 100 attempts to find a valid spot
-                    # Sample random XY positions for the active environments
-                    rand_xy = 2.0 * self.start_position_noise * (torch.rand(len(active_idx), 2, device=self.device) - 0.5)
-                    sampled_cube_state[active_idx, :2] = self._table_surface_pos[:2] + rand_xy
+            min_fwd_dist = 0.33
+            max_fwd_dist = 0.4
 
-                    # Check if the sampled points are inside the robot's no-spawn zone
-                    dist_from_robot_base = torch.linalg.norm(sampled_cube_state[active_idx, :2] - self.robot_base_pos, dim=-1)
-                    invalid_points = dist_from_robot_base < 0.30 #self.robot_base_clearance
-                    
-                    # If all points are valid, we're done
-                    if not torch.any(invalid_points):
-                        break
-                    
-                    # Update the active indices to only include the invalid ones that need re-sampling
-                    active_idx = active_idx[invalid_points]
-                
+            max_side_dist = 0.20
+
+            min_height_offset = 0.10
+            max_height_offset = 0.45
+
+            forward_offset = (min_fwd_dist + (max_fwd_dist - min_fwd_dist) * torch.rand(num_resets, device=self.device))
+
+            side_offset = max_side_dist * (2.0 * torch.rand(num_resets, device=self.device) - 1.0)
+
+            height_offset = (min_height_offset + (max_height_offset - min_height_offset) * torch.rand(num_resets, device=self.device))
+
+            sampled_cube_state = torch.zeros(num_resets, 13, device=self.device)
+            
+
+            sampled_cube_state[:, 0] = robot_base_pos[:, 0] + forward_offset
+            sampled_cube_state[:, 1] = robot_base_pos[:, 1] + side_offset
+            sampled_cube_state[:, 2] = robot_base_pos[:, 2] + height_offset
+            
+
+            cube_center_min_height = self.cubeA_size / 2.0
+            sampled_cube_state[:, 2] = torch.clamp(sampled_cube_state[:, 2], min=cube_center_min_height)
+
+            sampled_cube_state[:, 6] = 1.0
+
+            if cube == 'A':
                 self._init_cubeA_state[env_ids, :] = sampled_cube_state
-                
-    def _compute_osc_torques(self, dpose):
-        # Solve for Operational Space Control # Paper: khatib.stanford.edu/publications/pdfs/Khatib_1987_RA.pdf
-        # Helpful resource: studywolf.wordpress.com/2013/09/17/robot-control-4-operation-space-control/
-        q, qd = self._q[:, :7], self._qd[:, :7]
-        mm_inv = torch.inverse(self._mm)
-        m_eef_inv = self._j_eef @ mm_inv @ torch.transpose(self._j_eef, 1, 2)
-        m_eef = torch.inverse(m_eef_inv)
-
-        # Transform our cartesian action `dpose` into joint torques `u`
-        u = torch.transpose(self._j_eef, 1, 2) @ m_eef @ (
-                self.kp * dpose - self.kd * self.states["eef_vel"]).unsqueeze(-1)
-
-        # Nullspace control torques `u_null` prevents large changes in joint configuration
-        # They are added into the nullspace of OSC so that the end effector orientation remains constant
-        # roboticsproceedings.org/rss07/p31.pdf
-        j_eef_inv = m_eef @ self._j_eef @ mm_inv
-        u_null = self.kd_null * -qd + self.kp_null * (
-                (self.franka_default_dof_pos[:7] - q + np.pi) % (2 * np.pi) - np.pi)
-        u_null[:, 7:] *= 0
-        u_null = self._mm @ u_null.unsqueeze(-1)
-        u += (torch.eye(7, device=self.device).unsqueeze(0) - torch.transpose(self._j_eef, 1, 2) @ j_eef_inv) @ u_null
-
-        # Clip the values to be within valid effort range
-        u = tensor_clamp(u.squeeze(-1),
-                         -self._franka_effort_limits[:7].unsqueeze(0), self._franka_effort_limits[:7].unsqueeze(0))
-
-        return u
+                    
     
     def plot_results(self):
-        # Check if any data was collected
+
         if not self.plot_data["steps"]:
             print("No data collected for plotting.")
             return
@@ -694,137 +645,133 @@ class FrankaCubeStack(VecTask):
         
         plot_filename = "joint_tracking_plot.png"
         plt.savefig(plot_filename)
-        plt.close() # Frees up memory
+        plt.close() 
         print(f"--- Plot saved to {plot_filename} ---")
 
     def pre_physics_step(self, actions):
             self.actions = actions.clone().to(self.device)
+            self.actions = self.actions * self.action_scale
 
-            # --- Common IK Calculation ---
-            goal_pos = self.states["cubeA_pos"]
-            hand_pos = self.states["eef_pos"]
-            hand_rot = self.states["eef_quat"]
+            leg_target_pos = self.go2_default_dof_pos[self.leg_dof_indices]
+            self._pos_control[:, self.leg_dof_indices] = leg_target_pos
 
-            # Define a target orientation: pointing straight down (180-degree rotation around the x-axis)
-            # (w, x, y, z) format for gymapi.Quat, but torch_jit_utils uses (x, y, z, w)
-            down_q = to_torch([1.0, 0.0, 0.0, 0.0], device=self.device).repeat((self.num_envs, 1))
+            eef_pos = self.states["eef_pos"]
+            eef_quat = self.states["eef_quat"]
+            cube_pos = self.states["cubeA_pos"]
+            q_current_arm = self.states["q_arm"]
+            qd_current_arm = self.states["qd_arm"]
 
-            # Calculate position and orientation error
-            pos_error = goal_pos - hand_pos
-            orn_error = orientation_error(down_q, hand_rot)
+
+            down_q = to_torch([0, 0.7071, 0.0, 0.7071], device=self.device).repeat((self.num_envs, 1))
+            pos_error = cube_pos - eef_pos
+            # orn_error = torch.zeros_like(pos_error)
+            orn_error = orientation_error(down_q, eef_quat)
 
             dpose = torch.cat((pos_error, orn_error), dim=-1).unsqueeze(-1)
 
+  
+            # if self.progress_buf[0] < 20: # Print for the first couple of steps
+            #     print(f"\n--- Sliced Jacobian Check (Step {self.progress_buf[0].item()}) ---")
+            #     print(self._j_eef[0].cpu().numpy().round(3))
+            #     print("---------------------------------")
+
             delta_q = self.control_ik(dpose)
             
-            # This is the IK target we want to visualize
-            self.q_ref = self._q[:, :7] + delta_q
+            self.q_ref = q_current_arm + delta_q
+            self.alpha = 0.3
+            self.smooth_q_target = torch.zeros_like(self.q_ref) if not hasattr(self, 'smooth_q_target') else self.smooth_q_target
+            self.smooth_q_target = self.alpha * self.q_ref + (1.0 - self.alpha) * self.smooth_q_target
+            self.pos_error_pd = self.smooth_q_target - q_current_arm
+            self.vel_error_pd = -qd_current_arm  
+            self.pd_torques = self.arm_stiffness * self.pos_error_pd + self.arm_damping * self.vel_error_pd
 
-            # --- Control Logic Branching ---
+            self.decay_factor = 0.99
+            self.t = self.global_step_buf.item()
+            self.prior_weight = self.decay_factor ** (self.t / 100)
+            self.action_prior = self.prior_weight * self.pd_torques
 
-            if self.control_type == "retarget":
-                '''
-                KINEMATIC TELEPORT MODE
-                This block bypasses physics and directly sets the joint angles to the IK target.
-                '''
-                # 1. Get a writable copy of the full DOF state tensor
-                dof_state_copy = self._dof_state.clone()
+            self.final_arm_torques = torch.zeros_like(q_current_arm)
 
-                # 2. Set the arm joint positions (DOFs 0-6) to the IK target
-                dof_state_copy[:, :7, 0] = self.q_ref
-
-                # 3. Set the gripper joint positions (DOFs 7-8) based on the action
-                u_gripper = self.actions[:, -1]
-                gripper_target_pos = torch.where(u_gripper.unsqueeze(-1) >= 0.0,
-                                                self.franka_dof_upper_limits[-2:],
-                                                self.franka_dof_upper_limits[-2:])
-                dof_state_copy[:, 7:9, 0] = gripper_target_pos
-                
-                # 4. Zero out all joint velocities for a clean "snap"
-                dof_state_copy[:, :, 1] = 0.0
-
-                # 5. Apply the modified DOF state directly to the simulation
-                self.gym.set_dof_state_tensor(self.sim, gymtorch.unwrap_tensor(dof_state_copy))
-
-                # 6. Skip the physics-based commands at the end of the function
-                return
-            
-            elif self.control_type == "visualize_ik_target":
-                '''
-                BUILT-IN SIMULATOR POSITION CONTROL
-                This block sets the target joint angles and lets the simulator's
-                internal PID controller handle the physics.
-                '''
-                # --- Arm Control ---
-                # 1. Set the arm's target angles directly to the IK solution
-                self._pos_control[:, :7] = self.q_ref
-
-                # --- Gripper Control ---
-                # 2. Set the gripper's target angle based on the action
-                u_gripper = self.actions[:, -1]
-                gripper_target_pos = torch.where(u_gripper.unsqueeze(-1) >= 0.0,
-                                                 self.franka_dof_upper_limits[-2:],
-                                                 self.franka_dof_lower_limits[-2:])
-                # Set the gripper's target position in the buffer
-                self._pos_control[:, 7:9] = self.franka_dof_upper_limits[-2:]
+            if self.control_type == "ik_position":
+                self._pos_control[:, self.arm_dof_indices] = self.smooth_q_target
                 self.gym.set_dof_position_target_tensor(self.sim, gymtorch.unwrap_tensor(self._pos_control))
 
+
+            elif self.control_type == "ik_pd":
+                if self.progress_buf[0] < 5:
+                    print(f"Cube Pos: {self.states['cubeA_pos'][0].cpu().numpy().round(3)},  EEF Pos: {self.states['eef_pos'][0].cpu().numpy().round(3)}")
                 
-            elif self.control_type == "joint_tor":
-                '''
-                ORIGINAL CODE FOR TRAINING/RUNNING WITH TORQUE CONTROL
-                '''
-                beta = 100 * delta_q - 20 * self._qd[:, :7]
-                t = self.global_step_buf
-                decay_term = 0.99**(t / 100)
-                u_arm, u_gripper = self.actions[:, :-1], self.actions[:, -1]
-                u_arm = u_arm * self.cmd_limit / self.action_scale
-                final_torques = u_arm + decay_term.unsqueeze(-1) * beta
 
-                if self.control_type == "osc":
-                    print("OSC not yet")
-                    # u_arm = self._compute_osc_torques(dpose=u_arm)
-                
-                final_torques = tensor_clamp(final_torques,
-                                            -self._franka_effort_limits[:7],
-                                            self._franka_effort_limits[:7])
-                self._arm_control[:, :] = final_torques
+                arm_effort_limits = self.effort_limits[self.arm_dof_indices]
+                final_arm_torques = torch.clamp(self.pd_torques, -arm_effort_limits, arm_effort_limits)
 
-                # Control gripper
-                u_fingers = torch.zeros_like(self._gripper_control)
-                u_fingers[:, 0] = torch.where(u_gripper >= 0.0, self.franka_dof_upper_limits[-2].item(),
-                                            self.franka_dof_lower_limits[-2].item())
-                u_fingers[:, 1] = torch.where(u_gripper >= 0.0, self.franka_dof_upper_limits[-1].item(),
-                                            self.franka_dof_lower_limits[-1].item())
-                self._gripper_control[:, :] = u_fingers
+                # Apply the final torques to the arm's effort control buffer
+                self._effort_control[:, self.arm_dof_indices] = final_arm_torques
 
-                # Deploy actions
+
                 self.gym.set_dof_position_target_tensor(self.sim, gymtorch.unwrap_tensor(self._pos_control))
                 self.gym.set_dof_actuation_force_tensor(self.sim, gymtorch.unwrap_tensor(self._effort_control))
 
-            # Update last actions buffer
-            # self.last_actions[:] = self.actions[:]
+            elif self.control_type == "rl":
+                policy_pos = self.actions + self.go2_default_dof_pos[self.arm_dof_indices]
+                policy_torque = self.arm_stiffness * (policy_pos - q_current_arm) - self.arm_damping * qd_current_arm
+
+                total_torque = policy_torque + self.action_prior
+
+                final_arm_torques = torch.clamp(total_torque, -arm_effort_limits, arm_effort_limits)
+
+                self._effort_control[:, self.arm_dof_indices] = final_arm_torques
+                self.gym.set_dof_position_target_tensor(self.sim, gymtorch.unwrap_tensor(self._pos_control))
+                self.gym.set_dof_actuation_force_tensor(self.sim, gymtorch.unwrap_tensor(self._effort_control))
+
+                
 
     def post_physics_step(self):
         self.progress_buf += 1
         self.global_step_buf += 1
 
-        if self.control_type == "visualize_ik_target" and not self.plot_generated:
-            # Check if we still need to collect more data
-            if len(self.plot_data["steps"]) < self.max_plot_steps:
-                # Store data from the first environment
-                self.plot_data["steps"].append(self.global_step_buf[0].item())
-                self.plot_data["q_current"].append(self._q[0, :7].cpu().numpy())
-                self.plot_data["q_target"].append(self.q_ref[0, :7].cpu().numpy())
-            else:
-                # We have enough data, so generate the plot and set the flag
-                self.plot_results()
-                self.plot_generated = True
+        if self.viewer:
+            self.clear_lines()
+
+            q_ref_padded = self.go2_default_dof_pos.unsqueeze(0).repeat(self.num_envs, 1)
+
+            q_ref_padded[:, self.arm_dof_indices] = self.smooth_q_target
+
+            eef_pos_target_local = self.compute_fk(q_ref_padded)
+
+            robot_base_pos = self._base_state[:, 0:3]
+            robot_base_quat = self._base_state[:, 3:7]
+            eef_pos_target_world = quat_apply(robot_base_quat, eef_pos_target_local) + robot_base_pos
+
+            current_eef_world = self.states["eef_pos"]
+
+            i = 55
+            # Green sphere for the IK target
+            self.draw_sphere(pos=eef_pos_target_world[i], radius=0.025, color=(0.1, 1.0, 0.1), env_id=i)
+            # Red sphere for the robot's current EEF position
+            self.draw_sphere(pos=current_eef_world[i], radius=0.02, color=(1.0, 0.1, 0.1), env_id=i)
+
+        dist_to_cube = torch.norm(self.states["cubeA_pos_relative"], dim=-1)
+
+        is_successful_now = (dist_to_cube < 0.05)
+
+        self.success_buf = (self.success_buf + 1) * is_successful_now
+
+        task_complete_env_ids = (self.success_buf >= 10).nonzero(as_tuple=False).squeeze(-1)
+
+        if len(task_complete_env_ids) > 0:
+            print(f"--- SUCCESS! Envs {task_complete_env_ids.cpu().numpy()} completed the task. Resetting cube. ---")
+            self._reset_cubes(task_complete_env_ids)
+            self.success_buf[task_complete_env_ids] = 0
+
+            self.rew_buf[task_complete_env_ids] += 25.0
+
+            self.rew_buf[task_complete_env_ids] += 25.0
 
         env_ids = self.reset_buf.nonzero(as_tuple=False).squeeze(-1)
         if len(env_ids) > 0:
             self.reset_idx(env_ids)
-            self.global_step_buf[env_ids] = 0
+            # self.global_step_buf[env_ids] = 0
 
         cube_reset_env_ids=self.hold_time_achieved_buf.nonzero(as_tuple=False).squeeze(-1)
         if len(cube_reset_env_ids) > 0:
@@ -835,31 +782,52 @@ class FrankaCubeStack(VecTask):
         self.compute_observations()
         self.compute_reward(self.actions)
 
-        # # debug viz
-        # if self.viewer and self.debug_viz:
-        #     self.gym.clear_lines(self.viewer)
-        #     self.gym.refresh_rigid_body_state_tensor(self.sim)
-
-        #     # Grab relevant states to visualize
-        #     eef_pos = self.states["eef_pos"]
-        #     eef_rot = self.states["eef_quat"]
-        #     cubeA_pos = self.states["cubeA_pos"]
-        #     cubeA_rot = self.states["cubeA_quat"]
-
-
-        #     # Plot visualizations
-        #     for i in range(self.num_envs):
-        #         for pos, rot in zip((eef_pos, cubeA_pos, cubeB_pos), (eef_rot, cubeA_rot, cubeB_rot)):
-        #             px = (pos[i] + quat_apply(rot[i], to_torch([1, 0, 0], device=self.device) * 0.2)).cpu().numpy()
-        #             py = (pos[i] + quat_apply(rot[i], to_torch([0, 1, 0], device=self.device) * 0.2)).cpu().numpy()
-        #             pz = (pos[i] + quat_apply(rot[i], to_torch([0, 0, 1], device=self.device) * 0.2)).cpu().numpy()
-
-        #             p0 = pos[i].cpu().numpy()
-        #             self.gym.add_lines(self.viewer, self.envs[i], 1, [p0[0], p0[1], p0[2], px[0], px[1], px[2]], [0.85, 0.1, 0.1])
-        #             self.gym.add_lines(self.viewer, self.envs[i], 1, [p0[0], p0[1], p0[2], py[0], py[1], py[2]], [0.1, 0.85, 0.1])
-        #             self.gym.add_lines(self.viewer, self.envs[i], 1, [p0[0], p0[1], p0[2], pz[0], pz[1], pz[2]], [0.1, 0.1, 0.85])
-
         self.last_actions[:] = self.actions[:]
+
+
+    def plot_action_priors(self):
+        """Generates and saves a plot of the decay factor and action components."""
+        if not self.action_data_plotting["steps"]:
+            print("No action prior data collected for plotting.")
+            return
+
+        print(f"--- Generating action prior plot from {len(self.action_data_plotting['steps'])} data points ---")
+
+        steps = self.action_data_plotting["steps"]
+
+        fig, axs = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
+        fig.suptitle('Analysis of Decaying Action Priors (DecAP)', fontsize=16)
+
+        # Subplot 1: IK Target
+        axs[0].plot(steps, self.action_data_plotting["action_prior"], 'b', label='action_prior')
+        axs[0].set_ylabel('Torque (Nm)')
+        axs[0].set_title('Action Prior (β_t) Over Episode')
+        axs[0].grid(True)
+        axs[0].legend()
+        data_min = np.min(self.action_data_plotting["action_prior"])
+        data_max = np.max(self.action_data_plotting["action_prior"])
+        padding = (data_max - data_min) * 0.1 # Add 10% padding
+        axs[0].set_ylim(data_min - padding, data_max + padding)
+
+        # Subplot 2: Torque Components for Joint 0
+        # axs[1].plot(steps, self.action_data_plotting["action_prior"], 'r--', label='Action Prior')
+        axs[1].plot(steps, self.action_data_plotting["beta"], 'b:', label='Non-decayed Torque')
+        # axs[1].plot(steps, self.action_data_plotting["total_action"], 'k-', label='Final Torque (sent to robot)', linewidth=0.5)
+        axs[1].set_ylabel('Torque (Nm)')
+        axs[1].set_title('Non-decayed Torque Over Episode')
+        axs[1].grid(True)
+        axs[1].legend()
+        data_min = np.min(self.action_data_plotting["beta"])
+        data_max = np.max(self.action_data_plotting["beta"])
+        padding = (data_max - data_min) * 0.1 # Add 10% padding
+        axs[1].set_ylim(data_min - padding, data_max + padding)
+
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+
+        plot_filename = "action_priors_plot.png"
+        plt.savefig(plot_filename)
+        plt.close()
+        print(f"--- Action prior plot saved to {plot_filename} ---")
 
 #####################################################################
 ###=========================jit functions=========================###
@@ -867,68 +835,48 @@ class FrankaCubeStack(VecTask):
 
 
 @torch.jit.script
-def compute_franka_reward(
-    reset_buf: Tensor,
-    progress_buf: Tensor,
-    actions: Tensor,
-    states: Dict[str, Tensor],
-    reward_settings: Dict[str, float],
-    max_episode_length: float,
-    success_timer_buf: Tensor,
-    success_hold_steps: int,
-    q_ref: Tensor,
-    eef_pos_ref: Tensor
-) -> Tuple[Tensor, Tensor, Tensor, Tensor, Dict[str, Tensor]]:
+def compute_go2_arm_reward(
+    # --- Inputs ---
+    rew_buf: torch.Tensor,
+    reset_buf: torch.Tensor,
+    progress_buf: torch.Tensor,
+    actions: torch.Tensor,
+    base_lin_vel: torch.Tensor,
+    base_ang_vel: torch.Tensor,
+    trunk_height: torch.Tensor,
+    dist_to_cube: torch.Tensor,
+    max_episode_length: float
+) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
 
-    # -----------IMITATION REWARDS-----------
-    joint_pos_w, joint_pos_sigma = 1.5, 0.1
-    eef_pos_w,   eef_pos_sigma   = 1.5, 0.1
-
-
-    # --- 1a. Joint Position Reward  ---
-    joint_pos_error_sq = torch.sum(torch.square(q_ref - states["q"][:, :7]), dim=-1)
-    joint_pos_reward = joint_pos_w * torch.exp(-joint_pos_error_sq / joint_pos_sigma)
-
-
-    # --- 1b. End Effector Position Reward  ---
-    eef_pos_error_sq = torch.sum(torch.square(eef_pos_ref - states["eef_pos"]), dim=-1)
-    eef_pos_reward = eef_pos_w * torch.exp(-eef_pos_error_sq / eef_pos_sigma)
-
-    total_imitation_reward = joint_pos_reward  + eef_pos_reward 
-
-
-    #-------TASK-SPECIFIC REWARDS-----------
-
-    # 2a. Bonus for being close to the cube
-    dist_to_cube = torch.norm(states["cubeA_pos_relative"], dim=-1)
-    close_reward = reward_settings["r_lift_scale"] * (dist_to_cube < 0.045).float()
-
-    # Penalties to encourage smooth and efficient actions.
-    action_rate_penalty = -reward_settings["r_action_rate_scale"] * torch.norm(actions - states["last_actions"], dim=-1)
-    torque_penalty = -reward_settings["r_torque_scale"] * torch.sum(torch.square(actions), dim=-1)
-
-
-    # 2b. Sum all components to get the final reward
-    rewards = total_imitation_reward + close_reward + action_rate_penalty + torque_penalty
+    # === 1. Calculate Reward Components ===
     
-    # --- Create Dictionary for Logging ---
+    # a) Reach Reward: Primary reward for getting close to the cube
+    reach_reward = 1.0 * torch.exp(-10.0 * dist_to_cube)
+    
+    # b) Stationary Penalty: Penalize base movement
+    stationary_penalty = torch.sum(torch.square(base_lin_vel), dim=-1) + \
+                         torch.sum(torch.square(base_ang_vel), dim=-1)
+    
+    # c) Action Penalty: Encourage energy efficiency
+    action_penalty = torch.sum(torch.square(actions), dim=-1)
+
+    # === 2. Combine Rewards and Penalties (Weighted Sum) ===
+    total_reward = reach_reward - 0.1 * stationary_penalty - 0.001 * action_penalty
+    
+    # === 3. Update Reset Buffer ===
+    # Reset if fallen over, target is too far, or episode times out
+    resets = torch.where(trunk_height < 0.2, 1, 0)
+    resets = torch.where(dist_to_cube > 1.5, 1, resets)
+    resets = torch.where(progress_buf >= max_episode_length - 1, 1, resets)
+    
+    # === 4. Logging Dictionary ===
     log_metrics = {
-        "rewards/imitation_joint_pos": torch.mean(joint_pos_reward),
-        "rewards/imitation_eef_pos": torch.mean(eef_pos_reward),
-        # "rewards/imitation_eef_height": torch.mean(eef_height_reward),
-        "rewards/total_imitation": torch.mean(total_imitation_reward),
-        "rewards/close_reward": torch.mean(close_reward),
-        "rewards/action_rate_penalty": torch.mean(action_rate_penalty),
-        "rewards/torque_penalty": torch.mean(torque_penalty),
-        "rmse/joint_pos_imitation": torch.sqrt(torch.mean(joint_pos_error_sq)),
-        # "error/eef_pos": torch.sqrt(torch.mean(eef_pos_error_sq)),
+        "rewards/reach_reward": torch.mean(reach_reward),
+        "rewards/total_reward": torch.mean(total_reward),
+        "penalties/stationary_penalty": torch.mean(stationary_penalty),
+        "penalties/action_penalty": torch.mean(action_penalty),
+        "distance/eef_to_cube": torch.mean(dist_to_cube),
+        "info/trunk_height": torch.mean(trunk_height)
     }
 
-    # --- Episode End Logic ---
-    close_to_cube_for_hold = dist_to_cube < 0.045
-    success_timer_buf = torch.where(close_to_cube_for_hold, success_timer_buf + 1, torch.zeros_like(success_timer_buf))
-    hold_time_achieved = success_timer_buf >= success_hold_steps
-
-    reset_buf = torch.where(progress_buf >= max_episode_length - 1, torch.ones_like(reset_buf), reset_buf)
-
-    return rewards, reset_buf, success_timer_buf, hold_time_achieved, log_metrics
+    return total_reward, resets, log_metrics
