@@ -117,7 +117,7 @@ class FrankaCubeStack(VecTask):
         }
 
         # Controller type
-        self.control_type = "ik_position" 
+        self.control_type = "rl" #self.cfg["env"]["controlType"]
         assert self.control_type in {"ik_pd","rl","ik_position"},\
             "Invalid control type specified. Must be one of: {ik_pd , rl, ik_position}"
 
@@ -128,9 +128,9 @@ class FrankaCubeStack(VecTask):
             self.plot_generated = False  # Flag to ensure we only plot once
 
 
-        self.cfg["env"]["numObservations"] = 40
+        self.cfg["env"]["numObservations"] = 28
 
-        self.cfg["env"]["numActions"] = 18
+        self.cfg["env"]["numActions"] = 6
 
         # Values to be filled in at runtime
         self.states = {}                        # will be dict filled with relevant states to use for reward calculation
@@ -191,7 +191,9 @@ class FrankaCubeStack(VecTask):
         self.chain = pk.build_chain_from_urdf(open(urdf_path).read())
         self.chain = self.chain.to(device=self.device) # Move the model to the GPU
         self.eef_link_name = "eef_end_link"
-                
+        self.eef_pos_target_world = torch.zeros((self.num_envs, 3), device=self.device)
+        self.current_eef_world = torch.zeros((self.num_envs, 3), device=self.device)
+
         # Get DOF names from PyTorch Kinematics
         pk_dof_names = self.chain.get_joint_parameter_names()
         print("\n--- PyTorch Kinematics DOF Order ---")
@@ -300,8 +302,8 @@ class FrankaCubeStack(VecTask):
         #PD params
         leg_stiffness = 30.0
         leg_damping = 1.0
-        self.arm_stiffness = to_torch([400.0, 400.0, 200.0, 200.0, 10.0, 10.0], device=self.device)
-        self.arm_damping = to_torch([40.0, 40.0, 20.0, 20.0, 0.5, 0.5], device=self.device)
+        self.arm_stiffness = to_torch([15.0, 15.0, 15.0, 5.0, 5.0, 5.0], device=self.device)
+        self.arm_damping = to_torch([1, 1, 1, 0.1, 0.1, 0.1], device=self.device)
 
         # #BeyondMimic (for the arm)
         # # self.franka_dof_stiffness = to_torch([2368.7, 2368.7, 1776.5, 1776.5, 1776.5, 789.6, 789.6, 800.0, 800.0], dtype=torch.float, device=self.device)
@@ -322,8 +324,9 @@ class FrankaCubeStack(VecTask):
 
             elif "airbot_j" in name:
                 dof_props["driveMode"][i] = gymapi.DOF_MODE_POS if self.control_type == "ik_position" else gymapi.DOF_MODE_EFFORT
-                dof_props['stiffness'][i] = self.arm_stiffness[arm_joint_counter]
-                dof_props['damping'][i] = self.arm_damping[arm_joint_counter]
+                # Stiffness and Damping must be set to 0 for DOF_MODE_EFFORT
+                dof_props['stiffness'][i] = self.arm_stiffness[arm_joint_counter] if self.control_type == "ik_position" else 0.0
+                dof_props['damping'][i] = self.arm_damping[arm_joint_counter] if self.control_type == "ik_position" else 0.0
                 self.arm_dof_indices.append(i)
                 arm_joint_counter += 1
 
@@ -513,11 +516,17 @@ class FrankaCubeStack(VecTask):
             self.reset_buf,
             self.progress_buf,
             self.actions,
+            self.last_actions,
             base_lin_vel,
             base_ang_vel,
             trunk_height,
             dist_to_cube,
-            self.max_episode_length
+            self.max_episode_length,
+            self.smooth_q_target,
+            self.states["q_arm"],
+            self.eef_pos_target_world,
+            self.current_eef_world,
+
         )
         
         self.extras.update(metrics)
@@ -576,47 +585,52 @@ class FrankaCubeStack(VecTask):
             gymtorch.unwrap_tensor(multi_env_ids_cubes_int32), len(multi_env_ids_cubes_int32))
         
     def _reset_init_cube_state(self, cube, env_ids):
-            """
-            Resets the cube to a random position within the arm's workspace,
-            relative to the robot's base.
-            """
-            if env_ids is None or len(env_ids) == 0:
-                return
+        """
+        Resets the cube to a random position in a wide arc in front of the
+        FIXED robot base.
+        """
+        if env_ids is None or len(env_ids) == 0:
+            return
 
-            num_resets = len(env_ids)
+        num_resets = len(env_ids)
 
-            robot_base_pos = self._base_state[env_ids, 0:3]
 
-            min_fwd_dist = 0.33
-            max_fwd_dist = 0.4
+        min_radius = 0.30
+        max_radius = 0.45
 
-            max_side_dist = 0.20
+        min_angle_deg = -45.0
+        max_angle_deg = 45.0
+        min_angle_rad = (min_angle_deg / 180.0) * 3.14159
+        max_angle_rad = (max_angle_deg / 180.0) * 3.14159
 
-            min_height_offset = 0.10
-            max_height_offset = 0.45
+        min_height = 0.45
+        max_height = 0.55
 
-            forward_offset = (min_fwd_dist + (max_fwd_dist - min_fwd_dist) * torch.rand(num_resets, device=self.device))
 
-            side_offset = max_side_dist * (2.0 * torch.rand(num_resets, device=self.device) - 1.0)
+        # Sample a random distance from the center
+        radius = min_radius + (max_radius - min_radius) * torch.rand(num_resets, device=self.device)
+        
+        # Sample a random angle within the arc
+        angle = min_angle_rad + (max_angle_rad - min_angle_rad) * torch.rand(num_resets, device=self.device)
+        
 
-            height_offset = (min_height_offset + (max_height_offset - min_height_offset) * torch.rand(num_resets, device=self.device))
+        sampled_cube_state = torch.zeros(num_resets, 13, device=self.device)
+        
+ 
+        sampled_cube_state[:, 0] = radius * torch.cos(angle)  # X-coordinate
+        sampled_cube_state[:, 1] = radius * torch.sin(angle)  # Y-coordinate
+        sampled_cube_state[:, 2] = min_height + (max_height - min_height) * torch.rand(num_resets, device=self.device)
 
-            sampled_cube_state = torch.zeros(num_resets, 13, device=self.device)
-            
 
-            sampled_cube_state[:, 0] = robot_base_pos[:, 0] + forward_offset
-            sampled_cube_state[:, 1] = robot_base_pos[:, 1] + side_offset
-            sampled_cube_state[:, 2] = robot_base_pos[:, 2] + height_offset
-            
+        cube_center_min_height = self.cubeA_size / 2.0
+        sampled_cube_state[:, 2] = torch.clamp(sampled_cube_state[:, 2], min=cube_center_min_height)
+        
+      
+        sampled_cube_state[:, 6] = 1.0
 
-            cube_center_min_height = self.cubeA_size / 2.0
-            sampled_cube_state[:, 2] = torch.clamp(sampled_cube_state[:, 2], min=cube_center_min_height)
-
-            sampled_cube_state[:, 6] = 1.0
-
-            if cube == 'A':
-                self._init_cubeA_state[env_ids, :] = sampled_cube_state
-                    
+        if cube == 'A':
+            self._init_cubeA_state[env_ids, :] = sampled_cube_state
+                        
     
     def plot_results(self):
 
@@ -660,6 +674,7 @@ class FrankaCubeStack(VecTask):
             cube_pos = self.states["cubeA_pos"]
             q_current_arm = self.states["q_arm"]
             qd_current_arm = self.states["qd_arm"]
+            arm_effort_limits = self.effort_limits[self.arm_dof_indices]
 
 
             down_q = to_torch([0, 0.7071, 0.0, 0.7071], device=self.device).repeat((self.num_envs, 1))
@@ -681,12 +696,13 @@ class FrankaCubeStack(VecTask):
             self.alpha = 0.3
             self.smooth_q_target = torch.zeros_like(self.q_ref) if not hasattr(self, 'smooth_q_target') else self.smooth_q_target
             self.smooth_q_target = self.alpha * self.q_ref + (1.0 - self.alpha) * self.smooth_q_target
+            # self.smooth_q_target= torch.tensor([0.1, 0.2, 0.1, 0.0, 0.0, 0.0], device=self.device).repeat((self.num_envs, 1))
             self.pos_error_pd = self.smooth_q_target - q_current_arm
             self.vel_error_pd = -qd_current_arm  
             self.pd_torques = self.arm_stiffness * self.pos_error_pd + self.arm_damping * self.vel_error_pd
 
             self.decay_factor = 0.99
-            self.t = self.global_step_buf.item()
+            self.t = self.global_step_buf[0]
             self.prior_weight = self.decay_factor ** (self.t / 100)
             self.action_prior = self.prior_weight * self.pd_torques
 
@@ -698,12 +714,13 @@ class FrankaCubeStack(VecTask):
 
 
             elif self.control_type == "ik_pd":
-                if self.progress_buf[0] < 5:
-                    print(f"Cube Pos: {self.states['cubeA_pos'][0].cpu().numpy().round(3)},  EEF Pos: {self.states['eef_pos'][0].cpu().numpy().round(3)}")
                 
+                if self.progress_buf[0] < 5:
+                    print(f"Cube Pos: {self.states['cubeA_pos'][55].cpu().numpy().round(3)},  EEF Pos: {self.states['eef_pos'][55].cpu().numpy().round(3)}")
 
-                arm_effort_limits = self.effort_limits[self.arm_dof_indices]
                 final_arm_torques = torch.clamp(self.pd_torques, -arm_effort_limits, arm_effort_limits)
+
+                print("final_arm_torques:", final_arm_torques[55].cpu().numpy().round(3))
 
                 # Apply the final torques to the arm's effort control buffer
                 self._effort_control[:, self.arm_dof_indices] = final_arm_torques
@@ -741,15 +758,15 @@ class FrankaCubeStack(VecTask):
 
             robot_base_pos = self._base_state[:, 0:3]
             robot_base_quat = self._base_state[:, 3:7]
-            eef_pos_target_world = quat_apply(robot_base_quat, eef_pos_target_local) + robot_base_pos
+            self.eef_pos_target_world = quat_apply(robot_base_quat, eef_pos_target_local) + robot_base_pos
 
-            current_eef_world = self.states["eef_pos"]
+            self.current_eef_world = self.states["eef_pos"]
 
             i = 55
             # Green sphere for the IK target
-            self.draw_sphere(pos=eef_pos_target_world[i], radius=0.025, color=(0.1, 1.0, 0.1), env_id=i)
+            self.draw_sphere(pos=self.eef_pos_target_world[i], radius=0.025, color=(0.1, 1.0, 0.1), env_id=i)
             # Red sphere for the robot's current EEF position
-            self.draw_sphere(pos=current_eef_world[i], radius=0.02, color=(1.0, 0.1, 0.1), env_id=i)
+            self.draw_sphere(pos=self.current_eef_world[i], radius=0.02, color=(1.0, 0.1, 0.1), env_id=i)
 
         dist_to_cube = torch.norm(self.states["cubeA_pos_relative"], dim=-1)
 
@@ -760,7 +777,7 @@ class FrankaCubeStack(VecTask):
         task_complete_env_ids = (self.success_buf >= 10).nonzero(as_tuple=False).squeeze(-1)
 
         if len(task_complete_env_ids) > 0:
-            print(f"--- SUCCESS! Envs {task_complete_env_ids.cpu().numpy()} completed the task. Resetting cube. ---")
+            # print(f"--- SUCCESS! Envs {task_complete_env_ids.cpu().numpy()} completed the task. Resetting cube. ---")
             self._reset_cubes(task_complete_env_ids)
             self.success_buf[task_complete_env_ids] = 0
 
@@ -841,42 +858,59 @@ def compute_go2_arm_reward(
     reset_buf: torch.Tensor,
     progress_buf: torch.Tensor,
     actions: torch.Tensor,
+    last_actions: torch.Tensor,
     base_lin_vel: torch.Tensor,
     base_ang_vel: torch.Tensor,
     trunk_height: torch.Tensor,
     dist_to_cube: torch.Tensor,
-    max_episode_length: float
+    max_episode_length: float,
+    smooth_q_target: torch.Tensor,
+    current_q: torch.Tensor,
+    eef_pos_target_world: torch.Tensor,
+    current_eef_world: torch.Tensor,
+    # --- Outputs ---
 ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
 
-    # === 1. Calculate Reward Components ===
-    
     # a) Reach Reward: Primary reward for getting close to the cube
-    reach_reward = 1.0 * torch.exp(-10.0 * dist_to_cube)
-    
-    # b) Stationary Penalty: Penalize base movement
-    stationary_penalty = torch.sum(torch.square(base_lin_vel), dim=-1) + \
-                         torch.sum(torch.square(base_ang_vel), dim=-1)
-    
-    # c) Action Penalty: Encourage energy efficiency
+    # reach_reward = 1.0 * torch.exp(-10.0 * dist_to_cube)
+
+    # b) Action Penalty:
     action_penalty = torch.sum(torch.square(actions), dim=-1)
 
-    # === 2. Combine Rewards and Penalties (Weighted Sum) ===
-    total_reward = reach_reward - 0.1 * stationary_penalty - 0.001 * action_penalty
-    
-    # === 3. Update Reset Buffer ===
-    # Reset if fallen over, target is too far, or episode times out
-    resets = torch.where(trunk_height < 0.2, 1, 0)
-    resets = torch.where(dist_to_cube > 1.5, 1, resets)
-    resets = torch.where(progress_buf >= max_episode_length - 1, 1, resets)
-    
-    # === 4. Logging Dictionary ===
+    # c) Joint Position Imitation Reward
+    j_pos_error = smooth_q_target - current_q
+    q_error_magnitude = torch.norm(j_pos_error, dim=-1)
+    q_imitate_reward = 1.0 * torch.exp(-5.0 * q_error_magnitude)
+
+    # d) EEF Position Imitation Reward
+    eef_pos_error = eef_pos_target_world - current_eef_world
+    eef_error_magnitude = torch.norm(eef_pos_error, dim=-1)
+    eef_imitate_reward = 1.5 * torch.exp(-10.0 * eef_error_magnitude)
+
+    #e)Action Rate Penalty
+    action_rate_penalty = torch.sum(torch.square(actions - last_actions), dim=-1)
+
+    total_reward = (#reach_reward + 
+                    eef_imitate_reward + 
+                    q_imitate_reward -
+                    0.001 * action_penalty -
+                    0.005 * action_rate_penalty)
+
+
+
+    # resets = torch.where(dist_to_cube > 1.5, 1, resets)
+    reset_buf = torch.where(progress_buf >= max_episode_length - 1, 1, reset_buf)
+
     log_metrics = {
-        "rewards/reach_reward": torch.mean(reach_reward),
+        # "rewards/reach_reward": torch.mean(reach_reward),
+        "rewards/eef_imitate_reward": torch.mean(eef_imitate_reward),
+        "rewards/q_imitate_reward": torch.mean(q_imitate_reward),
         "rewards/total_reward": torch.mean(total_reward),
-        "penalties/stationary_penalty": torch.mean(stationary_penalty),
         "penalties/action_penalty": torch.mean(action_penalty),
-        "distance/eef_to_cube": torch.mean(dist_to_cube),
+        "penalties/torque_rate_penalty": torch.mean(action_rate_penalty),
+        "distance/eef_pos_error": torch.mean(eef_error_magnitude),
+        "distance/q_error": torch.mean(q_error_magnitude),
         "info/trunk_height": torch.mean(trunk_height)
     }
 
-    return total_reward, resets, log_metrics
+    return total_reward, reset_buf, log_metrics
